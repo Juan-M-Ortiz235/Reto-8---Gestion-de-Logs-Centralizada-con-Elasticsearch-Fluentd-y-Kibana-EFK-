@@ -1,0 +1,124 @@
+# =====================================================================
+#  Kibana 8.13.4 conectado al Elasticsearch del namespace 'logging'.
+#  Recursos:
+#    - ConfigMap con kibana.yml
+#    - Deployment 1 réplica
+#    - Service ClusterIP (puerto 5601) por defecto
+#  Acceso: por defecto interno. Para acceso desde tu navegador usa:
+#     kubectl port-forward -n logging svc/kibana 5601:5601
+#  Si quieres exponer públicamente, ver docs/04-kibana.md sección "LoadBalancer".
+# =====================================================================
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kibana-config
+  namespace: logging
+  labels:
+    app: kibana
+data:
+  kibana.yml: |
+    server.name: kibana
+    server.host: "0.0.0.0"
+    server.port: 5601
+    elasticsearch.hosts: ["http://elasticsearch.logging.svc.cluster.local:9200"]
+    # Telemetría desactivada para evitar tráfico saliente innecesario
+    telemetry.enabled: false
+    telemetry.optIn: false
+    # Logging básico
+    logging.appenders.default:
+      type: console
+      layout:
+        type: json
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kibana
+  namespace: logging
+  labels:
+    app: kibana
+spec:
+  type: ClusterIP
+  selector:
+    app: kibana
+  ports:
+    - name: http
+      port: 5601
+      targetPort: 5601
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kibana
+  namespace: logging
+  labels:
+    app: kibana
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kibana
+  strategy:
+    type: Recreate    # evita problemas de version skew entre 2 pods al actualizar
+  template:
+    metadata:
+      labels:
+        app: kibana
+    spec:
+      containers:
+        - name: kibana
+          image: docker.elastic.co/kibana/kibana:8.13.4
+          ports:
+            - name: http
+              containerPort: 5601
+
+          env:
+            # ELASTICSEARCH_HOSTS sobreescribe lo del kibana.yml por env-var (más explícito).
+            - name: ELASTICSEARCH_HOSTS
+              value: "http://elasticsearch.logging.svc.cluster.local:9200"
+            - name: SERVER_PUBLICBASEURL
+              value: "http://localhost:5601"
+            # Genera un encryptionKey estable (32 chars). En producción guárdalo en un Secret.
+            - name: XPACK_ENCRYPTEDSAVEDOBJECTS_ENCRYPTIONKEY
+              value: "reto8efkkibanaencryptionkey32chr"
+            - name: XPACK_REPORTING_ENCRYPTIONKEY
+              value: "reto8efkreportingencryptionkey32"
+            - name: XPACK_SECURITY_ENCRYPTIONKEY
+              value: "reto8efksecurityencryptionkey32c"
+
+          resources:
+            requests:
+              cpu: "200m"
+              memory: "1Gi"
+            limits:
+              cpu: "1000m"
+              memory: "1.5Gi"
+
+          volumeMounts:
+            - name: config
+              mountPath: /usr/share/kibana/config/kibana.yml
+              subPath: kibana.yml
+
+          readinessProbe:
+            httpGet:
+              path: /api/status
+              port: 5601
+            initialDelaySeconds: 60
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 30   # Kibana puede tardar 1-2 min en arrancar
+
+          livenessProbe:
+            tcpSocket:
+              port: 5601
+            initialDelaySeconds: 120
+            periodSeconds: 20
+
+      volumes:
+        - name: config
+          configMap:
+            name: kibana-config

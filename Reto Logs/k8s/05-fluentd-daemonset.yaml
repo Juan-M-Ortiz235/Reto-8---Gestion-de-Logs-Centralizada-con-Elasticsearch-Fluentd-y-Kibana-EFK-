@@ -1,0 +1,90 @@
+# =====================================================================
+#  Fluentd DaemonSet - 1 pod por nodo del cluster.
+#  Imagen: fluent/fluentd-kubernetes-daemonset:v1.16-debian-elasticsearch8-1
+#    (incluye plugins: elasticsearch, kubernetes_metadata_filter, parser_cri)
+# =====================================================================
+
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: fluentd
+  namespace: logging
+  labels:
+    app: fluentd
+spec:
+  selector:
+    matchLabels:
+      app: fluentd
+  template:
+    metadata:
+      labels:
+        app: fluentd
+    spec:
+      serviceAccountName: fluentd
+
+      # Tolerancia para que Fluentd corra incluso en nodos master tainted
+      # (en DOKS los workers no tienen taints, pero lo dejamos por buena práctica)
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+        - key: node-role.kubernetes.io/master
+          operator: Exists
+          effect: NoSchedule
+
+      containers:
+        - name: fluentd
+          image: fluent/fluentd-kubernetes-daemonset:v1.16-debian-elasticsearch8-1
+
+          env:
+            - name: FLUENT_ELASTICSEARCH_HOST
+              value: "elasticsearch.logging.svc.cluster.local"
+            - name: FLUENT_ELASTICSEARCH_PORT
+              value: "9200"
+            - name: FLUENT_ELASTICSEARCH_SCHEME
+              value: "http"
+            - name: FLUENT_ELASTICSEARCH_SSL_VERIFY
+              value: "false"
+            - name: FLUENT_ELASTICSEARCH_LOGSTASH_FORMAT
+              value: "true"
+            # Desactiva el SNI (mejor compatibilidad con clusters single-node)
+            - name: FLUENT_ELASTICSEARCH_SNIFFER_CLASS_NAME
+              value: "Fluent::Plugin::ElasticsearchSimpleSniffer"
+            # Desactiva el archivo de config por defecto de la imagen para
+            # que use solo el nuestro (montado vía ConfigMap).
+            - name: FLUENT_CONF
+              value: "fluent.conf"
+
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "200Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+
+          volumeMounts:
+            # Logs de los contenedores en cada nodo
+            - name: varlog
+              mountPath: /var/log
+            # Symlinks reales de los logs en containerd
+            - name: varlibdockercontainers
+              mountPath: /var/lib/docker/containers
+              readOnly: true
+            # Nuestra config personalizada
+            - name: config
+              mountPath: /fluentd/etc/fluent.conf
+              subPath: fluent.conf
+
+      terminationGracePeriodSeconds: 30
+
+      volumes:
+        - name: varlog
+          hostPath:
+            path: /var/log
+        - name: varlibdockercontainers
+          hostPath:
+            path: /var/lib/docker/containers
+        - name: config
+          configMap:
+            name: fluentd-config

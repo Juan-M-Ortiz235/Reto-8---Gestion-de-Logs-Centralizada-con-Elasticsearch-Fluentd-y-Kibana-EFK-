@@ -1,0 +1,180 @@
+# =====================================================================
+#  Elasticsearch single-node para el reto EFK
+#  Versión: 8.13.4
+#  Recursos:
+#    - StatefulSet con 1 réplica
+#    - PVC de 10 Gi en DO Block Storage
+#    - Service ClusterIP en el puerto 9200
+#    - Headless Service para identidad de red estable del StatefulSet
+#  Seguridad: deshabilitada (X-Pack security) para simplificar la demo.
+# =====================================================================
+
+---
+# ConfigMap con la config principal de Elasticsearch.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: elasticsearch-config
+  namespace: logging
+  labels:
+    app: elasticsearch
+data:
+  elasticsearch.yml: |
+    cluster.name: efk-cluster
+    node.name: ${HOSTNAME}
+    network.host: 0.0.0.0
+    discovery.type: single-node
+    xpack.security.enabled: false
+    xpack.security.enrollment.enabled: false
+    xpack.security.http.ssl.enabled: false
+    xpack.security.transport.ssl.enabled: false
+    xpack.ml.enabled: false
+
+---
+# Headless service: requerido por StatefulSets para DNS estable
+# (elasticsearch-0.elasticsearch-headless.logging.svc.cluster.local).
+apiVersion: v1
+kind: Service
+metadata:
+  name: elasticsearch-headless
+  namespace: logging
+  labels:
+    app: elasticsearch
+spec:
+  clusterIP: None
+  selector:
+    app: elasticsearch
+  ports:
+    - name: rest
+      port: 9200
+      targetPort: 9200
+    - name: transport
+      port: 9300
+      targetPort: 9300
+
+---
+# Service ClusterIP "amigable" para que Kibana y Fluentd se conecten
+# a http://elasticsearch.logging.svc.cluster.local:9200
+apiVersion: v1
+kind: Service
+metadata:
+  name: elasticsearch
+  namespace: logging
+  labels:
+    app: elasticsearch
+spec:
+  type: ClusterIP
+  selector:
+    app: elasticsearch
+  ports:
+    - name: rest
+      port: 9200
+      targetPort: 9200
+    - name: transport
+      port: 9300
+      targetPort: 9300
+
+---
+# StatefulSet de Elasticsearch.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: elasticsearch
+  namespace: logging
+  labels:
+    app: elasticsearch
+spec:
+  serviceName: elasticsearch-headless
+  replicas: 1
+  selector:
+    matchLabels:
+      app: elasticsearch
+  template:
+    metadata:
+      labels:
+        app: elasticsearch
+    spec:
+      # securityContext a nivel pod: el contenedor de ES (uid 1000) debe
+      # poder escribir en el volumen montado.
+      securityContext:
+        fsGroup: 1000
+        runAsUser: 1000
+
+      # Init container con privilegios para tunear vm.max_map_count.
+      # ES recomienda 262144; los nodos de DOKS suelen venir con un valor
+      # menor. El init corre antes que el contenedor principal.
+      initContainers:
+        - name: sysctl-vm-max-map-count
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - "sysctl -w vm.max_map_count=262144"
+          securityContext:
+            privileged: true
+            runAsUser: 0
+
+      containers:
+        - name: elasticsearch
+          image: docker.elastic.co/elasticsearch/elasticsearch:8.13.4
+          ports:
+            - name: rest
+              containerPort: 9200
+            - name: transport
+              containerPort: 9300
+
+          env:
+            - name: ES_JAVA_OPTS
+              value: "-Xms1g -Xmx1g"   # heap JVM 1 GB
+            - name: cluster.name
+              value: "efk-cluster"
+            - name: discovery.type
+              value: "single-node"
+
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "1.5Gi"
+            limits:
+              cpu: "1500m"
+              memory: "2.5Gi"
+
+          volumeMounts:
+            - name: data
+              mountPath: /usr/share/elasticsearch/data
+            - name: config
+              mountPath: /usr/share/elasticsearch/config/elasticsearch.yml
+              subPath: elasticsearch.yml
+
+          readinessProbe:
+            httpGet:
+              path: /_cluster/health?local=true
+              port: 9200
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+          livenessProbe:
+            tcpSocket:
+              port: 9200
+            initialDelaySeconds: 90
+            periodSeconds: 20
+
+      volumes:
+        - name: config
+          configMap:
+            name: elasticsearch-config
+
+  # PVC dinámico — DO Block Storage provisiona 10 Gi automáticamente.
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          app: elasticsearch
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: do-block-storage
+        resources:
+          requests:
+            storage: 10Gi

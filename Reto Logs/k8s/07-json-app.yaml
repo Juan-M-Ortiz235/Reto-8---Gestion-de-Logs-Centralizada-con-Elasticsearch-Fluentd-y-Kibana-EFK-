@@ -1,0 +1,128 @@
+# =====================================================================
+#  JSON App - simula una API real emitiendo logs estructurados en JSON.
+#  Cada log tiene: timestamp, level (info/warn/error), method, path,
+#  status, latency_ms, user_id y un mensaje.
+#
+#  Para evitar tener que construir una imagen Docker, usamos la imagen
+#  oficial de Python con un script Python embebido en un ConfigMap.
+# =====================================================================
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: json-app-script
+  namespace: apps
+  labels:
+    app: json-app
+data:
+  app.py: |
+    #!/usr/bin/env python3
+    """
+    Mini app simulada que emite logs JSON al stdout.
+    Útil para demostrar parsing de logs estructurados en EFK.
+    """
+    import json
+    import random
+    import sys
+    import time
+    import uuid
+    from datetime import datetime, timezone
+
+    # Pesos para que la mayoría sean info, algunos warn, pocos error
+    LEVELS  = ["info", "info", "info", "info", "info", "info", "warn", "warn", "error"]
+    METHODS = ["GET", "GET", "GET", "POST", "POST", "PUT", "DELETE"]
+    PATHS = [
+        "/api/users",
+        "/api/users/{id}",
+        "/api/products",
+        "/api/products/{id}",
+        "/api/orders",
+        "/api/login",
+        "/api/health",
+    ]
+    STATUS_BY_LEVEL = {
+        "info":  [200, 200, 200, 201, 204],
+        "warn":  [301, 302, 400, 401, 404],
+        "error": [500, 502, 503, 504],
+    }
+    MESSAGES_BY_LEVEL = {
+        "info":  ["request handled", "user authenticated", "cache hit",
+                  "data persisted", "job completed"],
+        "warn":  ["slow query detected", "cache miss", "rate limit close",
+                  "deprecated endpoint used", "auth retry"],
+        "error": ["database connection lost", "upstream timeout",
+                  "unhandled exception", "out of memory", "panic recovered"],
+    }
+
+    def emit_log():
+        level   = random.choice(LEVELS)
+        path    = random.choice(PATHS).replace("{id}", str(random.randint(1, 9999)))
+        latency = random.randint(5, 800) if level != "error" else random.randint(800, 5000)
+
+        record = {
+            "@timestamp":  datetime.now(timezone.utc).isoformat(),
+            "level":       level,
+            "service":     "json-app",
+            "method":      random.choice(METHODS),
+            "path":        path,
+            "status":      random.choice(STATUS_BY_LEVEL[level]),
+            "latency_ms":  latency,
+            "user_id":     f"u-{random.randint(1, 200):04d}",
+            "request_id":  str(uuid.uuid4()),
+            "msg":         random.choice(MESSAGES_BY_LEVEL[level]),
+        }
+        # Imprime una línea JSON por log (NDJSON) y flush para tiempo real
+        print(json.dumps(record), flush=True)
+
+    if __name__ == "__main__":
+        # Emite un log de inicio
+        print(json.dumps({
+            "@timestamp": datetime.now(timezone.utc).isoformat(),
+            "level": "info",
+            "service": "json-app",
+            "msg": "json-app starting"
+        }), flush=True)
+
+        while True:
+            emit_log()
+            # Una pausa aleatoria entre 0.5 y 3 segundos
+            time.sleep(random.uniform(0.5, 3.0))
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: json-app
+  namespace: apps
+  labels:
+    app: json-app
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: json-app
+  template:
+    metadata:
+      labels:
+        app: json-app
+    spec:
+      containers:
+        - name: json-app
+          image: python:3.12-alpine
+          command: ["python3", "/app/app.py"]
+          resources:
+            requests:
+              cpu: "20m"
+              memory: "32Mi"
+            limits:
+              cpu: "100m"
+              memory: "128Mi"
+          volumeMounts:
+            - name: script
+              mountPath: /app
+      volumes:
+        - name: script
+          configMap:
+            name: json-app-script
+            defaultMode: 0755

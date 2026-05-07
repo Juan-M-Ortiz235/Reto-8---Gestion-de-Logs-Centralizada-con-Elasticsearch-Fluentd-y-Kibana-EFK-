@@ -1,0 +1,94 @@
+# =====================================================================
+#  Nginx demo - servidor web con página HTML simple.
+#  Genera logs de acceso en formato 'combined' (formato estándar nginx).
+#
+#  Para acceder: kubectl port-forward -n apps svc/nginx-demo 8080:80
+# =====================================================================
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nginx-demo-html
+  namespace: apps
+  labels:
+    app: nginx-demo
+data:
+  index.html: |
+    <!DOCTYPE html>
+    <html lang="es">
+    <head>
+      <meta charset="UTF-8">
+      <title>Reto 8 - EFK Demo</title>
+      <style>
+        body { font-family: sans-serif; margin: 60px; background: #0f172a; color: #f1f5f9; }
+        h1 { color: #38bdf8; }
+        a { color: #fbbf24; }
+      </style>
+    </head>
+    <body>
+      <h1>Reto 8 - Gestión de logs centralizada</h1>
+      <p>Este Nginx está corriendo en DOKS y sus logs viajan al cluster EFK.</p>
+      <ul>
+        <li><a href="/">/</a> - Home</li>
+        <li><a href="/about">/about</a></li>
+        <li><a href="/api/products">/api/products</a></li>
+        <li><a href="/error-test">/error-test</a> (genera 404)</li>
+      </ul>
+    </body>
+    </html>
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nginx-demo
+  namespace: apps
+  labels:
+    app: nginx-demo
+spec:
+  type: ClusterIP
+  selector:
+    app: nginx-demo
+  ports:
+    - name: http
+      port: 80
+      targetPort: 80
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx-demo
+  namespace: apps
+  labels:
+    app: nginx-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nginx-demo
+  template:
+    metadata:
+      labels:
+        app: nginx-demo
+    spec:
+      containers:
+        - name: nginx
+          image: nginx:1.25-alpine
+          ports:
+            - containerPort: 80
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "32Mi"
+            limits:
+              cpu: "200m"
+              memory: "128Mi"
+          volumeMounts:
+            - name: html
+              mountPath: /usr/share/nginx/html
+      volumes:
+        - name: html
+          configMap:
+            name: nginx-demo-html

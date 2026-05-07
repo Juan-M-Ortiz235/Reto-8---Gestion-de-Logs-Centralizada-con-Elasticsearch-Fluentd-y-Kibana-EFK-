@@ -1,0 +1,229 @@
+# =====================================================================
+#  ConfigMap con la configuración de Fluentd (Fase 7).
+#
+#  Cambios respecto a la Fase 5:
+#    - Se añade rewrite_tag_filter para retag-ear según container_name.
+#    - Se aplican parsers específicos (regex Nginx, JSON parser).
+#    - Se rutean los logs a 3 índices distintos en Elasticsearch:
+#         · nginx-logs-*    para el servidor web
+#         · jsonapp-logs-*  para la app JSON
+#         · k8s-logs-*      para el resto del cluster
+# =====================================================================
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fluentd-config
+  namespace: logging
+  labels:
+    app: fluentd
+data:
+  fluent.conf: |
+    # ----------------------------------------------------------------
+    # Source: lee logs de TODOS los contenedores en formato CRI.
+    # ----------------------------------------------------------------
+    <source>
+      @type tail
+      @id in_tail_container_logs
+      path /var/log/containers/*.log
+      pos_file /var/log/fluentd-containers.log.pos
+      tag kubernetes.*
+      read_from_head true
+      <parse>
+        @type cri
+      </parse>
+    </source>
+
+    # ----------------------------------------------------------------
+    # Filter: enriquece con metadata de Kubernetes.
+    # ----------------------------------------------------------------
+    <filter kubernetes.**>
+      @type kubernetes_metadata
+      @id filter_kube_metadata
+      skip_labels false
+      skip_container_metadata false
+      skip_namespace_metadata false
+      skip_master_url true
+      de_dot true
+      de_dot_separator _
+    </filter>
+
+    # ----------------------------------------------------------------
+    # Filter: limpia campos que causan conflicto de mapping.
+    # ----------------------------------------------------------------
+    <filter kubernetes.**>
+      @type record_transformer
+      remove_keys time,docker
+    </filter>
+
+    # ----------------------------------------------------------------
+    # Descartar logs propios de Fluentd (evita feedback loop).
+    # ----------------------------------------------------------------
+    <match fluent.**>
+      @type null
+    </match>
+
+    <match kubernetes.var.log.containers.fluentd**.log>
+      @type null
+    </match>
+
+    # ----------------------------------------------------------------
+    # Retag basado en container_name. Esto separa el flujo en 3:
+    #   · nginx.**      → logs de Nginx
+    #   · jsonapp.**    → logs de la JSON app
+    #   · k8s.**        → todo lo demás (kube-system, ES, Kibana, etc.)
+    # ----------------------------------------------------------------
+    <match kubernetes.**>
+      @type rewrite_tag_filter
+      <rule>
+        key $.kubernetes.container_name
+        pattern ^nginx$
+        tag nginx.${tag}
+      </rule>
+      <rule>
+        key $.kubernetes.container_name
+        pattern ^json-app$
+        tag jsonapp.${tag}
+      </rule>
+      <rule>
+        key $.kubernetes.container_name
+        pattern .+
+        tag k8s.${tag}
+      </rule>
+    </match>
+
+    # ----------------------------------------------------------------
+    # Parser Nginx (formato combined estándar).
+    # Extrae: remote, host, user, time, method, path, code, size,
+    #         referer, agent.
+    # Si la línea no calza (p.ej. logs de error en otro formato),
+    # se conserva el record original gracias a 'reserve_data true'.
+    # ----------------------------------------------------------------
+    <filter nginx.**>
+      @type parser
+      key_name message
+      reserve_data true
+      remove_key_name_field false
+      emit_invalid_record_to_error false
+      <parse>
+        @type regexp
+        expression /^(?<remote>[^ ]*) (?<host>[^ ]*) (?<user>[^ ]*) \[(?<nginx_time>[^\]]*)\] "(?<method>\S+)(?: +(?<path>[^\"]*?)(?: +\S*)?)?" (?<code>[^ ]*) (?<size>[^ ]*)(?: "(?<referer>[^\"]*)" "(?<agent>[^\"]*)")?$/
+        time_key nginx_time
+        time_format %d/%b/%Y:%H:%M:%S %z
+        keep_time_key true
+        types code:integer,size:integer
+      </parse>
+    </filter>
+
+    # ----------------------------------------------------------------
+    # Parser JSON app: cada línea es un JSON con sus propios campos.
+    # ----------------------------------------------------------------
+    <filter jsonapp.**>
+      @type parser
+      key_name message
+      reserve_data true
+      remove_key_name_field false
+      emit_invalid_record_to_error false
+      <parse>
+        @type json
+      </parse>
+    </filter>
+
+    # ----------------------------------------------------------------
+    # Output: Nginx → índice nginx-logs-*
+    # ----------------------------------------------------------------
+    <match nginx.**>
+      @type elasticsearch
+      @id out_es_nginx
+      host elasticsearch.logging.svc.cluster.local
+      port 9200
+      scheme http
+      logstash_format true
+      logstash_prefix nginx-logs
+      logstash_dateformat %Y.%m.%d
+      include_tag_key true
+      tag_key @log_name
+      suppress_type_name true
+      log_es_400_reason true
+      request_timeout 30s
+      reload_on_failure true
+      reload_connections false
+      <buffer>
+        @type file
+        path /var/log/fluentd-buffers/nginx.buffer
+        flush_mode interval
+        flush_interval 5s
+        flush_thread_count 2
+        retry_forever true
+        retry_max_interval 30
+        chunk_limit_size 2M
+        queue_limit_length 32
+        overflow_action block
+      </buffer>
+    </match>
+
+    # ----------------------------------------------------------------
+    # Output: JSON app → índice jsonapp-logs-*
+    # ----------------------------------------------------------------
+    <match jsonapp.**>
+      @type elasticsearch
+      @id out_es_jsonapp
+      host elasticsearch.logging.svc.cluster.local
+      port 9200
+      scheme http
+      logstash_format true
+      logstash_prefix jsonapp-logs
+      logstash_dateformat %Y.%m.%d
+      include_tag_key true
+      tag_key @log_name
+      suppress_type_name true
+      log_es_400_reason true
+      request_timeout 30s
+      reload_on_failure true
+      reload_connections false
+      <buffer>
+        @type file
+        path /var/log/fluentd-buffers/jsonapp.buffer
+        flush_mode interval
+        flush_interval 5s
+        flush_thread_count 2
+        retry_forever true
+        retry_max_interval 30
+        chunk_limit_size 2M
+        queue_limit_length 32
+        overflow_action block
+      </buffer>
+    </match>
+
+    # ----------------------------------------------------------------
+    # Output: el resto del cluster → índice k8s-logs-*
+    # ----------------------------------------------------------------
+    <match k8s.**>
+      @type elasticsearch
+      @id out_es_k8s
+      host elasticsearch.logging.svc.cluster.local
+      port 9200
+      scheme http
+      logstash_format true
+      logstash_prefix k8s-logs
+      logstash_dateformat %Y.%m.%d
+      include_tag_key true
+      tag_key @log_name
+      suppress_type_name true
+      log_es_400_reason true
+      request_timeout 30s
+      reload_on_failure true
+      reload_connections false
+      <buffer>
+        @type file
+        path /var/log/fluentd-buffers/k8s.buffer
+        flush_mode interval
+        flush_interval 5s
+        flush_thread_count 2
+        retry_forever true
+        retry_max_interval 30
+        chunk_limit_size 2M
+        queue_limit_length 32
+        overflow_action block
+      </buffer>
+    </match>

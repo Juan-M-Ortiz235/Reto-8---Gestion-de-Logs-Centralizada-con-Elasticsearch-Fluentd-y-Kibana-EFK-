@@ -1,0 +1,64 @@
+# =====================================================================
+#  Load generator - pod que genera tráfico continuo contra el Nginx demo
+#  para que veamos logs interesantes en Kibana sin tener que estar
+#  curl-eando manualmente.
+#
+#  Hace requests a varios paths (/, /about, /api/products, /error-test)
+#  con frecuencia variable para simular un patrón de tráfico realista.
+#
+#  Usa alpine:3.19 (no curlimages/curl porque ese es scratch y le faltan
+#  utilidades como sh, sleep, date, etc.).
+# =====================================================================
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: load-generator
+  namespace: apps
+  labels:
+    app: load-generator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: load-generator
+  template:
+    metadata:
+      labels:
+        app: load-generator
+    spec:
+      containers:
+        - name: load
+          image: alpine:3.19
+          command:
+            - /bin/sh
+            - -c
+            - |
+              # Instala curl al arrancar (alpine no lo trae por defecto)
+              apk add --no-cache curl >/dev/null 2>&1
+              # Espera a que Nginx termine de arrancar
+              sleep 30
+              echo "load-generator starting"
+              # Lista de paths con pesos: '/' es el más visitado (4x), '/about' 2x,
+              # '/api/products' 3x, '/error-test' 1x → ~10% de errores 404 esperados
+              PATHS="/ / / / /about /about /api/products /api/products /api/products /error-test"
+              # Convierte la lista en argumentos posicionales
+              set -- $PATHS
+              NUM=$#
+              while true; do
+                # Selecciona un índice aleatorio entre 1 y NUM
+                IDX=$(( (RANDOM % NUM) + 1 ))
+                P=$(eval echo \$$IDX)
+                # Hace la request silenciosa, mostrando solo el código HTTP
+                CODE=$(curl -s -o /dev/null -w "%{http_code}" "http://nginx-demo.apps.svc.cluster.local${P}")
+                echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) GET ${P} -> ${CODE}"
+                # Pausa aleatoria entre 1 y 5 segundos
+                sleep $(( (RANDOM % 5) + 1 ))
+              done
+          resources:
+            requests:
+              cpu: "10m"
+              memory: "16Mi"
+            limits:
+              cpu: "50m"
+              memory: "64Mi"
